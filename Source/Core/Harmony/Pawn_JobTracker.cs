@@ -60,7 +60,7 @@ internal static class Patch_DetermineNextJob
         if (pawn.def.race.intelligence == Intelligence.Humanlike)
         {
            //Sanity check, make sure the mount driver is still valid
-        if (pawn.IsMounted() && (pawn.IsColonist || pawn.Faction.HostileTo(Current.gameInt.worldInt.factionManager.ofPlayer)))
+        if (pawn.IsMounted)
         {
             var pawnData = pawn.GetExtendedPawnData();
             var mount = pawnData.Mount;
