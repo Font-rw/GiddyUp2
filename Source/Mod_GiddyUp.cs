@@ -1,549 +1,431 @@
-﻿using GiddyUpRideAndRoll;
-using GiddyUpCaravan;
-using GiddyUp.Jobs;
+﻿using GiddyUp.Jobs;
 using RimWorld;
 using System;
-using System.Linq;
 using System.Collections.Generic;
+using System.Linq;
 using GiddyUpCore.RideAndRoll;
 using Verse;
 using UnityEngine;
 using static GiddyUp.ModSettings_GiddyUp;
+using Color = UnityEngine.Color;
 
 namespace GiddyUp;
 
-[StaticConstructorOnStartup]
-public static class Setup
-{
-    public static readonly List<ThingDef?> AllAnimals = []; //Only used during setup and for the mod options UI
-    
-    private static readonly HashSet<ushort> DefEditLedger = [];
-    private static readonly HashSet<int> PatchLedger = [];
-
-    private static readonly SimpleCurve SizeFactor =
-    [
-        new CurvePoint(1.2f, 0.9f),
-        new CurvePoint(1.5f, 1f),
-        new CurvePoint(2.4f, 1.15f),
-        new CurvePoint(4f, 1.25f)
-    ];
-
-    private static readonly SimpleCurve SpeedFactor =
-    [
-        new CurvePoint(4.3f, 1f),
-        new CurvePoint(5.8f, 1.2f),
-        new CurvePoint(8f, 1.4f)
-    ];
-
-    private static readonly SimpleCurve ValueFactor =
-    [
-        new CurvePoint(300f, 1f),
-        new CurvePoint(550f, 1.15f),
-        new CurvePoint(5000f, 1.3f)
-    ];
-
-    private static readonly SimpleCurve WildnessFactor =
-    [
-        new CurvePoint(0.2f, 1f),
-        new CurvePoint(0.6f, 0.9f),
-        new CurvePoint(1f, 0.85f)
-    ];
-
-    static Setup()
-    {
-        var harmony = new HarmonyLib.Harmony("GiddyUp");
-        harmony.PatchAll();
-
-        JobDriver_Mounted.BuildAllowedJobsCache(noMountedHunting);
-        BuildMountCache();
-        MountUtility.BuildAnimalBiomeCache();
-        if (!rideAndRollEnabled)
-            RemoveRideAndRoll();
-        if (!caravansEnabled)
-            RemoveCaravans();
-
-        ProcessPawnKinds(harmony);
-        if (disableSlavePawnColumn)
-            DefDatabase<PawnTableDef>.GetNamed("Animals").columns.RemoveAll(x => x.defName == "MountableBySlaves");
-
-        //VE Classical mod support
-        var type = HarmonyLib.AccessTools.TypeByName("AnimalBehaviours.AnimalCollectionClass");
-        if (type != null)
-            ExtendedDataStorage.noFleeingAnimals = HarmonyLib.Traverse.Create(type).Field("nofleeing_animals")
-                ?.GetValue<HashSet<Thing>>();
-    }
-
-    //Responsible for caching which animals are mounted, draw layering behavior, and calling caravan speed bonuses
-    private static void BuildMountCache()
-    {
-        //Setup collections
-        invertMountingRules ??= [];
-        invertDrawRules ??= [];
-
-        var animalDefs = DefDatabase<ThingDef>.AllDefsListForReading.Where(def => def.race is { Animal: true } && !def.IsCorpse).ToList();
-        foreach (var def in animalDefs)
-        {
-            var setting = def.race.baseBodySize > ResourceBank.DefaultSizeThreshold;
-            if (def.HasModExtension<NotMountable>())
-                setting = false;
-            else if (def.HasModExtension<Mountable>())
-                setting = true;
-            if (invertMountingRules.Contains(def.defName))
-                setting = !setting; //Player customization says to invert rule.
-
-            if (setting)
-            {
-                MountableCache.Add(def.shortHash);
-                CalculateCaravanSpeed(def);
-            }
-            else
-            {
-                MountableCache.Remove(def.shortHash);
-            }
-
-            //Handle the draw front/behind draw instruction cache
-            setting = def.HasModExtension<DrawInFront>();
-            if (invertDrawRules.Contains(def.defName))
-                setting = !setting;
-
-            if (setting)
-                DrawRulesCache.Add(def.shortHash);
-            else
-                DrawRulesCache.Remove(def.shortHash);
-        }
-
-        animalDefs.SortBy(x => x.label);
-        AllAnimals.AddRange(animalDefs);
-    }
-
-    //Responsible for setting up the draw offsets and custom stat overrides
-    public static void ProcessPawnKinds(HarmonyLib.Harmony? harmony = null)
-    {
-        var newEntries = false;
-        var usingCustomStats = false;
-        if (offsetCache == null)
-            offsetCache = new Dictionary<string, float>();
-        var list = DefDatabase<PawnKindDef>.AllDefsListForReading;
-        var length = list.Count;
-        for (var i = 0; i < length; i++)
-        {
-            var pawnKindDef = list[i];
-            if (pawnKindDef.race == null)
-                continue;
-            if (!usingCustomStats && pawnKindDef.HasModExtension<CustomStats>())
-                usingCustomStats = true;
-
-            //Only process animals that can be mounted
-            if (MountableCache.Contains(pawnKindDef.race.shortHash))
-            {
-                //Determine which life stages are considered mature enough to ride
-                var lifeStages = pawnKindDef.lifeStages;
-                var lifeIndexes = lifeStages?.Count;
-                AllowedLifeStages? customLifeStages;
-                if (lifeIndexes > 0)
-                    customLifeStages = pawnKindDef.race.GetModExtension<AllowedLifeStages>();
-                else
-                    customLifeStages = null;
-
-                //Go through each life stage for this animal
-                for (var lifeIndex = 0; lifeIndex < lifeIndexes; lifeIndex++)
-                {
-                    //Convert the def and age into a key string used for storage between sessions
-                    if (lifeIndex != lifeIndexes - 1 &&
-                        (customLifeStages == null || !customLifeStages.IsAllowedAge(lifeIndex)))
-                        continue;
-                    var key = TextureUtility.FormatKey(pawnKindDef, lifeIndex);
-
-                    //Skip if already set
-                    if (offsetCache.ContainsKey(key))
-                        continue;
-
-                    //Build out...
-                    var offset = TextureUtility.SetDrawOffset(lifeStages[lifeIndex]);
-                    offsetCache.Add(key, offset);
-                    newEntries = true;
-                }
-            }
-        }
-
-        //Write to settings file
-        if (newEntries)
-            LoadedModManager.GetMod<Mod_GiddyUp>().modSettings.Write();
-
-        //Only bother applying this harmony patch if using a mod that utilizes this extension
-        if (usingCustomStats && harmony != null && !PatchLedger.Add(1))
-            harmony.Patch(HarmonyLib.AccessTools.Method(typeof(ArmorUtility), nameof(ArmorUtility.ApplyArmor)),
-                postfix: new HarmonyLib.HarmonyMethod(typeof(Harmony.Patch_ApplyArmor),
-                    nameof(Harmony.Patch_ApplyArmor.Postfix)));
-    }
-
-    //TODO: It may be possible to fold this into th BuildCache method
-    public static void RebuildInversions()
-    {
-        //Reset
-        invertMountingRules = new HashSet<string>();
-        invertDrawRules = new HashSet<string>();
-
-        foreach (var animalDef in AllAnimals)
-        {
-            var hash = animalDef.shortHash;
-            //Search for abnormalities, meaning the player wants to invert the rules
-            if (animalDef.HasModExtension<NotMountable>())
-            {
-                if (MountableCache.Contains(hash))
-                    invertMountingRules.Add(animalDef.defName);
-            }
-            else if (animalDef.HasModExtension<Mountable>())
-            {
-                if (!MountableCache.Contains(hash))
-                    invertMountingRules.Add(animalDef.defName);
-            }
-            else if (animalDef.race.baseBodySize <= ResourceBank.DefaultSizeThreshold)
-            {
-                if (MountableCache.Contains(hash))
-                    invertMountingRules.Add(animalDef.defName);
-            }
-            else
-            {
-                if (!MountableCache.Contains(hash))
-                    invertMountingRules.Add(animalDef.defName);
-            }
-
-            //And now draw rules
-            var drawFront = false;
-            var modExt = animalDef.GetModExtension<DrawInFront>();
-            if (modExt != null)
-                drawFront = true;
-
-            if (drawFront && !DrawRulesCache.Contains(hash) || !drawFront && DrawRulesCache.Contains(hash))
-                invertDrawRules.Add(animalDef.defName);
-        }
-    }
-
-    private static void RemoveRideAndRoll()
-    {
-        //Remove jobs
-        DefDatabase<JobDef>.Remove(ResourceBank.JobDefOf.WaitForRider);
-
-        //Remove pawn columns (UI icons in the pawn table)
-        DefDatabase<PawnTableDef>.GetNamed("Animals").columns.RemoveAll(x =>
-            x.defName == "MountableByColonists" || x.defName == "MountableBySlaves");
-
-        //Remove area designators
-        var designationCategoryDef = DefDatabase<DesignationCategoryDef>.GetNamed("Zone");
-        designationCategoryDef.specialDesignatorClasses.RemoveAll(x =>
-            x == typeof(Designator_GU_DropAnimal_Expand) ||
-            x == typeof(Designator_GU_DropAnimal_Clear) ||
-            x == typeof(Designator_GU_NoMount_Expand) ||
-            x == typeof(Designator_GU_NoMount_Clear)
-        );
-        var workingList = new List<Designator>(designationCategoryDef.resolvedDesignators);
-        foreach (var designator in workingList)
-            if (designator is Designator_GU_DropAnimal_Expand ||
-                designator is Designator_GU_DropAnimal_Clear ||
-                designator is Designator_GU_NoMount_Expand ||
-                designator is Designator_GU_NoMount_Clear)
-                designationCategoryDef.resolvedDesignators.Remove(designator);
-    }
-
-    private static void RemoveCaravans()
-    {
-        //Remove area designators
-        var designationCategoryDef = DefDatabase<DesignationCategoryDef>.GetNamed("Zone");
-        designationCategoryDef.specialDesignatorClasses.RemoveAll(x =>
-            x == typeof(Designator_GU_DropAnimal_NPC_Clear) ||
-            x == typeof(Designator_GU_DropAnimal_NPC_Expand)
-        );
-        var workingList = new List<Designator>(designationCategoryDef.resolvedDesignators);
-        foreach (var designator in workingList)
-            if (designator is Designator_GU_DropAnimal_NPC_Clear ||
-                designator is Designator_GU_DropAnimal_NPC_Expand)
-                designationCategoryDef.resolvedDesignators.Remove(designator);
-    }
-
-    public static void CalculateCaravanSpeed(ThingDef def, bool check = false)
-    {
-        //Horse		2.4 size	5.8 speed	packAnimal	550 value	0.35 wildeness	= 1.6
-        //Thrumbo	4.0 size	5.5 speed	!packAnimal	4000 value	0.985 wildness	= 1.5
-        //Dromedary	2.1 size	4.3 speed	packAnimal	300 value	0.25 wildeness	= 1.3
-
-        //Muffalo	2.4 size	4.5 speed	packAnimal	300 value	0.6 wildness	= ???
-
-        float speed;
-
-        //This would pass if the animal has an XML-defined bonus that we didn't apply, leave it alone
-        if (def.StatBaseDefined(StatDefOf.CaravanRidingSpeedFactor) && !DefEditLedger.Contains(def.shortHash))
-        {
-            return;
-        }
-        //This would pass if mod options are changed, the mount is no longer rideable, and it was once given a bonus
-        else if (check && !MountableCache.Contains(def.shortHash) && DefEditLedger.Contains(def.shortHash))
-        {
-            DefEditLedger.Remove(def.shortHash);
-            speed = 1f;
-        }
-        //Give the bonus
-        else if (giveCaravanSpeed)
-        {
-            DefEditLedger.Add(def.shortHash);
-            speed = SizeFactor.Evaluate(def.race.baseBodySize) *
-                    SpeedFactor.Evaluate(def.GetStatValueAbstract(StatDefOf.MoveSpeed)) *
-                    ValueFactor.Evaluate(def.BaseMarketValue) *
-                    WildnessFactor.Evaluate(def.GetStatValueAbstract(StatDefOf.Wildness)) *
-                    (def.race.packAnimal ? 1.1f : 0.95f);
-            if (speed < 1.00001f)
-                speed = 1.00001f;
-        }
-        //Don't give a bonus and instead just set the value to be above 1f so the game thinks it's a rideable mount on the caravan UI, but low enough to render as 100%
-        else
-        {
-            DefEditLedger.Remove(def.shortHash);
-            speed = speed = 1.00001f;
-        }
-
-        StatUtility.SetStatValueInList(ref def.statBases, StatDefOf.CaravanRidingSpeedFactor, speed);
-    }
-}
-
 public class Mod_GiddyUp : Mod
 {
+#if DEBUG
+    public static Mod_GiddyUp Instance;
+#endif
+    private static int coreLineNumber, mechLineNumber;
+    private readonly QuickSearchWidget search = new QuickSearchWidget();
+
+    private string? drawBehavior;
     public Mod_GiddyUp(ModContentPack content) : base(content)
     {
         GetSettings<ModSettings_GiddyUp>();
+#if DEBUG
+        Instance = this;
+#endif
     }
 
     public override void DoSettingsWindowContents(Rect inRect)
     {
         //========Setup tabs=========
         GUI.BeginGroup(inRect);
-        var tabs = new List<TabRecord>();
-        tabs.Add(new TabRecord("GUC_Core_Tab".Translate(), delegate { selectedTab = SelectedTab.Core; },
-            selectedTab == SelectedTab.Core || selectedTab == SelectedTab.BodySize ||
-            selectedTab == SelectedTab.DrawBehavior));
-        tabs.Add(new TabRecord("GUC_RnR_Tab".Translate(), delegate { selectedTab = SelectedTab.Rnr; },
-            selectedTab == SelectedTab.Rnr));
-        tabs.Add(new TabRecord("GUC_BattleMounts_Tab".Translate(), delegate { selectedTab = SelectedTab.BattleMounts; },
-            selectedTab == SelectedTab.BattleMounts));
-        tabs.Add(new TabRecord("GUC_Caravans_Tab".Translate(), delegate { selectedTab = SelectedTab.Caravans; },
-            selectedTab == SelectedTab.Caravans));
+        var tabs = new List<TabRecord>
+        {
+            new("GUC_Core_Tab".Translate(), delegate { selectedTab = SelectedTab.Core; search.Reset(); },
+                selectedTab is SelectedTab.Core or SelectedTab.BodySize or SelectedTab.DrawBehavior),
+            new("GUC_RnR_Tab".Translate(), delegate { selectedTab = SelectedTab.Rnr; },
+                selectedTab == SelectedTab.Rnr),
+            new("GUC_BattleMounts_Tab".Translate(), delegate { selectedTab = SelectedTab.BattleMounts; },
+                selectedTab == SelectedTab.BattleMounts),
+            new("GUC_Caravans_Tab".Translate(), delegate { selectedTab = SelectedTab.Caravans; },
+                selectedTab == SelectedTab.Caravans),
+            new("GU_Mechanoids_Tab".Translate(), delegate { selectedTab = SelectedTab.Mechanoids; search.Reset(); },
+                selectedTab == SelectedTab.Mechanoids),
+            //new("GUC_Ideology_Tab".Translate(), delegate { selectedTab = SelectedTab.Ideo;},
+            //        selectedTab == SelectedTab.Ideo)
+        };
 
-        var rect = new Rect(0f, 32f, inRect.width, inRect.height - 32f);
-        Widgets.DrawMenuSection(rect);
-        TabDrawer.DrawTabs(new Rect(0f, 32f, inRect.width, Text.LineHeight), tabs);
+        var currentTabRect = new Rect(0f, Text.LineHeight + 6, inRect.width, inRect.height - Text.LineHeight - 6);
+        Widgets.DrawMenuSection(currentTabRect);
 
+        new Rect(0f, 0, inRect.width, Text.LineHeight).SplitVerticallyWithMargin(out var tabsHeader,
+            out var refreshCache, out _, 4f, rightWidth: Text.LineHeight);
+        if (Widgets.ButtonImageWithBG(refreshCache, TexUI.RotRightTex, new Vector2(16, 16)))
+            offsetCache = null;
+        TooltipHandler.TipRegion(refreshCache, () => "GU_Reset_Cache".Translate(), 427985);
+        DrawTabs(tabsHeader, tabs);
+        
+        
         switch (selectedTab)
         {
             case SelectedTab.Core:
             case SelectedTab.BodySize:
             case SelectedTab.DrawBehavior:
-                DrawCore();
+                DrawCore(currentTabRect);
                 break;
             case SelectedTab.Rnr:
-                DrawRnR();
+                DrawRnR(currentTabRect);
                 break;
             case SelectedTab.BattleMounts:
-                DrawBattleMounts();
+                DrawBattleMounts(currentTabRect);
                 break;
-            default:
-                DrawCaravan();
+            case SelectedTab.Caravans:
+                DrawCaravan(currentTabRect);
+                break;
+            case SelectedTab.Mechanoids:
+                DrawMechanoid(currentTabRect);
+                break;
+            case SelectedTab.Ideo:
+                DrawIdeo(currentTabRect);
                 break;
         }
+
         GUI.EndGroup();
+    }
 
-        void DrawRnR()
+
+    private void DrawCore(Rect inRect)
+    {
+        if (selectedTab == SelectedTab.Core)
+            selectedTab = SelectedTab.BodySize;
+
+        var options = new Listing_Standard();
+        var view = inRect.ContractedBy(15f);
+        options.Begin(view);
+
+        options.Label(
+            "GUC_HandlingMovementImpact_Title".Translate("0", "10", "2.5", handlingMovementImpact.ToString()), -1f,
+            "GUC_HandlingMovementImpact_Description".Translate());
+        handlingMovementImpact = options.Slider((float)Math.Round(handlingMovementImpact, 1), 0f, 10f);
+
+        options.Label("GUC_AccuracyPenalty_Title".Translate("0", "100", "10", accuracyPenalty.ToString()), -1f,
+            "GUC_AccuracyPenalty_Description".Translate());
+        accuracyPenalty = (int)options.Slider(accuracyPenalty, 0f, 100f);
+
+        options.Label(
+            "GUC_HandlingAccuracyImpact_Title".Translate("0", "2", "0.5", handlingAccuracyImpact.ToString()), -1f,
+            "GUC_HandlingAccuracyImpact_Description".Translate());
+        handlingAccuracyImpact = options.Slider((float)Math.Round(handlingAccuracyImpact, 1), 0f, 2f);
+
+
+        var disregardsRow = options.GetRect(Text.LineHeight);
+        disregardsRow.SplitVerticallyWithMargin(out var disregardsCapacity, out var disregardsAge, 4f);
+
+        // Disregard Capacity
+        if (Mouse.IsOver(disregardsCapacity))
+            Widgets.DrawHighlight(disregardsCapacity);
+        TooltipHandler.TipRegion(disregardsCapacity, () => "GUM_DisCarCapText".Translate(), 8542);
+        Widgets.CheckboxLabeled(disregardsCapacity, "GUM_DisCarCap".Translate(), ref disregardAnimalCarryingCapacity);
+
+        //Disregard Age
+        if (Mouse.IsOver(disregardsAge))
+            Widgets.DrawHighlight(disregardsAge);
+        Widgets.CheckboxLabeled(disregardsAge, "GUC_DisAgeCap".Translate(), ref disregardAnimalAge);
+
+        //========Setup tabs=========
+        var tabs = new List<TabRecord>
         {
-            var options = new Listing_Standard();
-            options.Begin(rect.ContractedBy(15f));
+            new("GUC_Mountable_Tab".Translate(), delegate { selectedTab = SelectedTab.BodySize; },
+                selectedTab == SelectedTab.BodySize),
+            new("GUC_DrawBehavior_Tab".Translate(),
+                delegate { selectedTab = SelectedTab.DrawBehavior; }, selectedTab == SelectedTab.DrawBehavior)
+        };
+        var tabsRow = options.GetRect(Text.LineHeight);
 
-            options.CheckboxLabeled("GU_Enable_RnR".Translate(), ref rideAndRollEnabled,
-                "GU_Enable_RnR_Description".Translate());
-            if (rideAndRollEnabled)
-            {
-                options.Gap();
-                options.GapLine(); //=============================
-                options.Gap();
+        DrawTabs(tabsRow, tabs);
 
-                options.Label(
-                    "GU_RR_MinAutoMountDistance_Title".Translate("0", "500", "120", minAutoMountDistance.ToString()),
-                    -1f, "GU_RR_MinAutoMountDistance_Description".Translate());
-                minAutoMountDistance = (int)options.Slider(minAutoMountDistance, 20f, 500f);
+        options.Gap(6f);
+        var mountableFilterRect = options.GetRect(view.height - options.CurHeight);
 
-                options.Label("GU_RR_AutoHitchDistance_Title".Translate("0", "200", "50", autoHitchDistance.ToString()),
-                    -1f, "GU_RR_AutoHitchDistance_Description".Translate());
-                autoHitchDistance = (int)options.Slider(autoHitchDistance, 0f, 200f);
-
-                options.Label(
-                    "GU_RR_InjuredThreshold_Title".Translate("0", "100", "75",
-                        Math.Round(injuredThreshold * 100f).ToString()), -1f,
-                    "GU_RR_InjuredThreshold_Description".Translate());
-                injuredThreshold = options.Slider(injuredThreshold, 0f, 1f);
-
-                options.Label(
-                    "GU_RR_WaitForRiderTimer_Title".Translate("1000", "30000", "10000",
-                        Math.Round(waitForRiderTimer / 2500f, 1)), -1f,
-                    "GU_RR_WaitForRiderTimer_Description".Translate());
-                waitForRiderTimer = (int)options.Slider(waitForRiderTimer, 0f, 30000f);
-
-                options.CheckboxLabeled("GU_RR_NoMountedHunting_Title".Translate(), ref noMountedHunting,
-                    "GU_RR_NoMountedHunting_Description".Translate());
-                options.CheckboxLabeled("GU_RR_DisableSlavePawnColumn_Title".Translate(), ref disableSlavePawnColumn,
-                    "GU_RR_DisableSlavePawnColumn_Description".Translate());
-                options.CheckboxLabeled("GU_RR_AutomountDisabledByDefault_Title".Translate(),
-                    ref automountDisabledByDefault, "GU_RR_AutomountDisabledByDefault_Description".Translate());
-                if (Prefs.DevMode)
-                    options.CheckboxLabeled("Enable dev mode logging", ref logging);
-            }
-
-            options.End();
+        //========Between tabs and scroll body=========
+        Widgets.DrawMenuSection(mountableFilterRect);
+        var tabView = mountableFilterRect.ContractedBy(1f);
+        var mountOptions = new Listing_Standard();
+        
+        mountOptions.Begin(tabView);
+        mountOptions.Gap();
+        var filtersRect = mountOptions.GetRect(Text.LineHeight);
+        filtersRect = filtersRect.LeftPartPixels(filtersRect.width - 20f);
+        filtersRect = filtersRect.ContractedBy(4f, 0f);
+        drawBehavior ??= "GUC_DrawBehavior_Description".Translate();
+        filtersRect.SplitVerticallyWithMargin(out var searchRect, out var filterRect, out var _, compressibleMargin: 4f,
+            rightWidth: selectedTab == SelectedTab.DrawBehavior ? Text.CalcSize(drawBehavior).x : filtersRect.width / 2);
+        filterRect.width += 20f;
+        if (selectedTab == SelectedTab.BodySize)
+        {
+            search.OnGUI(searchRect);
+            Widgets.HorizontalSlider(filterRect, ref bodySizeFilter, new FloatRange(0f, 5f),
+                "GUC_BodySizeFilter_Title".Translate(bodySizeFilter.ToString()), 0.1f);
         }
-
-        void DrawBattleMounts()
+        else
         {
-            var options = new Listing_Standard();
-            options.Begin(rect.ContractedBy(15f));
-
-            options.CheckboxLabeled("GU_Enable_BattleMounts".Translate(), ref battleMountsEnabled,
-                "GU_Enable_BattleMounts_Description".Translate());
-            if (battleMountsEnabled)
-            {
-                options.Gap();
-                options.GapLine(); //=============================
-                options.Gap();
-
-                options.Label("BM_MinHandlingLevel_Title".Translate("0", "20", "3", minHandlingLevel.ToString()), -1f,
-                    "BM_MinHandlingLevel_Description".Translate());
-                minHandlingLevel = (int)options.Slider(minHandlingLevel, 0f, 20f);
-
-                options.Label("BM_EnemyMountChance_Title".Translate("0", "100", "15", enemyMountChance.ToString()), -1f,
-                    "BM_EnemyMountChance_Description".Translate());
-                enemyMountChance = (int)options.Slider(enemyMountChance, 0f, 100f);
-
-                options.Label(
-                    "BM_EnemyMountChanceTribal_Title".Translate("0", "100", "33", enemyMountChancePreInd.ToString()),
-                    -1f, "BM_EnemyMountChanceTribal_Description".Translate());
-                enemyMountChancePreInd = (int)options.Slider(enemyMountChancePreInd, 0f, 100f);
-
-                options.Label("BM_InBiomeWeight_Title".Translate("0", "100", "20", inBiomeWeight.ToString()), -1f,
-                    "BM_InBiomeWeight_Description".Translate());
-                inBiomeWeight = options.Slider((float)Math.Round(inBiomeWeight), 0f, 100f);
-
-                options.Label("BM_OutBiomeWeight_Title".Translate("0", "100", "10", outBiomeWeight.ToString()), -1f,
-                    "BM_OutBiomeWeight_Description".Translate());
-                outBiomeWeight = (int)options.Slider((float)Math.Round(outBiomeWeight), 0f, 100f);
-
-                options.Label("BM_NonWildWeight_Title".Translate("0", "100", "70", nonWildWeight.ToString()), -1f,
-                    "BM_NonWildWeight_Description".Translate());
-                nonWildWeight = (int)options.Slider((float)Math.Round(nonWildWeight), 0f, 100f);
-            }
-
-            options.End();
+            var anchor = Text.Anchor;
+            Text.Anchor = TextAnchor.MiddleCenter;
+            Widgets.Label(filterRect, drawBehavior);
+            Text.Anchor = anchor;
+            search.OnGUI(searchRect);
         }
+        //========Search widget=========
+        
+        var animalsForViewing = Setup.AllAnimals.Where(animal =>
+            search.filter.Matches(animal?.label)
+            || search.filter.Matches(animal?.defName)
+            || search.filter.Matches(animal?.modContentPack?.Name)).ToList();
+        mountOptions.Gap(4f);
+        var previousHeight = mountOptions.CurHeight;
+        mountOptions.End();
 
-        void DrawCaravan()
+        //========Scroll area=========
+        var scrollOptions = new Listing_Standard();
+        var scrollView = tabView.BottomPartPixels(tabView.height - previousHeight);
+        var mountableFilterInnerRect = scrollView with
         {
-            var options = new Listing_Standard();
-            options.Begin(rect.ContractedBy(15f));
+            width = scrollView.width - 20f,
+            height = coreLineNumber * OptionsDrawUtility.LineHeight
+        };
+        var scrollY = coreScrollPos.y;
+        var min = scrollY == 0 ? 0 : (int)Mathf.Floor(scrollY / OptionsDrawUtility.LineHeight);
+        var max = (int)Mathf.Ceil(scrollView.height / OptionsDrawUtility.LineHeight) + min;
+        var viewRange = new IntRange(min - 1, max + 1);
 
-            options.CheckboxLabeled("GU_Enable_Caravans".Translate(), ref caravansEnabled,
-                "GU_Enable_Caravans_Description".Translate());
-            if (caravansEnabled)
-            {
-                options.Gap();
-                options.GapLine(); //=============================
-                options.Gap();
+        Widgets.BeginScrollView(scrollView, ref coreScrollPos, mountableFilterInnerRect);
+        scrollOptions.Begin(mountableFilterInnerRect);
+        scrollOptions.DrawList(animalsForViewing, selectedTab == SelectedTab.BodySize ? MountableCache : DrawRulesCache, viewRange, out coreLineNumber);
+        scrollOptions.End();
+        Widgets.EndScrollView();
+        options.End();
 
-                options.Label(
-                    "GU_Car_visitorMountChance_Title".Translate("0", "100", "15", visitorMountChance.ToString()), -1f,
-                    "GU_Car_visitorMountChance_Description".Translate());
-                visitorMountChance = (int)options.Slider(visitorMountChance, 0f, 100f);
+    }
 
-                options.Label(
-                    "GU_Car_visitorMountChanceTribal_Title".Translate("0", "100", "33",
-                        visitorMountChancePreInd.ToString()), -1f,
-                    "GU_Car_visitorMountChanceTribal_Description".Translate());
-                visitorMountChancePreInd = (int)options.Slider(visitorMountChancePreInd, 0f, 100f);
+    private void DrawRnR(Rect rect)
+    {
+        var options = new Listing_Standard();
+        options.Begin(rect.ContractedBy(15f));
 
-                options.CheckboxLabeled("GU_Car_GiveCaravanSpeed_Title".Translate(), ref giveCaravanSpeed,
-                    "GU_Car_GiveCaravanSpeed_Description".Translate());
-                options.CheckboxLabeled("GU_Car_RidePackAnimals_Title".Translate(), ref ridePackAnimals,
-                    "GU_Car_RidePackAnimals_Description".Translate());
-            }
-
-            options.End();
-        }
-
-        void DrawCore()
+        options.CheckboxLabeled("GU_Enable_RnR".Translate(), ref rideAndRollEnabled,
+            "GU_Enable_RnR_Description".Translate());
+        if (rideAndRollEnabled)
         {
-            if (selectedTab == SelectedTab.Core)
-                selectedTab = SelectedTab.BodySize;
-
-            var options = new Listing_Standard();
-            options.Begin(inRect.ContractedBy(15f));
-
-            options.Label(
-                "GUC_HandlingMovementImpact_Title".Translate("0", "10", "2.5", handlingMovementImpact.ToString()), -1f,
-                "GUC_HandlingMovementImpact_Description".Translate());
-            handlingMovementImpact = options.Slider((float)Math.Round(handlingMovementImpact, 1), 0f, 10f);
-
-            options.Label("GUC_AccuracyPenalty_Title".Translate("0", "100", "10", accuracyPenalty.ToString()), -1f,
-                "GUC_AccuracyPenalty_Description".Translate());
-            accuracyPenalty = (int)options.Slider(accuracyPenalty, 0f, 100f);
-
-            options.Label(
-                "GUC_HandlingAccuracyImpact_Title".Translate("0", "2", "0.5", handlingAccuracyImpact.ToString()), -1f,
-                "GUC_HandlingAccuracyImpact_Description".Translate());
-            handlingAccuracyImpact = options.Slider((float)Math.Round(handlingAccuracyImpact, 1), 0f, 2f);
-
+            options.Gap();
+            options.GapLine(); //=============================
             options.Gap();
 
-            if (options.ButtonText("GU_Reset_Cache".Translate()))
-                offsetCache = null;
+            options.Label(
+                "GU_RR_MinAutoMountDistance_Title".Translate("0", "500", "120", minAutoMountDistance.ToString()),
+                -1f, "GU_RR_MinAutoMountDistance_Description".Translate());
+            minAutoMountDistance = (int)options.Slider(minAutoMountDistance, 20f, 500f);
 
-            //Record positioning before closing out the lister...
-            var mountableFilterRect = inRect.ContractedBy(15f);
-            mountableFilterRect.y = options.curY + 90f;
-            mountableFilterRect.height = inRect.height - options.curY - 105f; //Use remaining space
+            options.Label("GU_RR_AutoHitchDistance_Title".Translate("0", "200", "50", autoHitchDistance.ToString()),
+                -1f, "GU_RR_AutoHitchDistance_Description".Translate());
+            autoHitchDistance = (int)options.Slider(autoHitchDistance, 0f, 200f);
 
-            options.End();
+            options.Label(
+                "GU_RR_InjuredThreshold_Title".Translate("0", "100", "75",
+                    Math.Round(injuredThreshold * 100f).ToString()), -1f,
+                "GU_RR_InjuredThreshold_Description".Translate());
+            injuredThreshold = options.Slider(injuredThreshold, 0f, 1f);
 
-            //========Setup tabs=========
-            tabs = new List<TabRecord>();
-            tabs.Add(new TabRecord("GUC_Mountable_Tab".Translate(), delegate { selectedTab = SelectedTab.BodySize; },
-                selectedTab == SelectedTab.BodySize));
-            tabs.Add(new TabRecord("GUC_DrawBehavior_Tab".Translate(),
-                delegate { selectedTab = SelectedTab.DrawBehavior; }, selectedTab == SelectedTab.DrawBehavior));
+            options.Label(
+                "GU_RR_WaitForRiderTimer_Title".Translate("1000", "30000", "10000",
+                    Math.Round(waitForRiderTimer / 2500f, 1)), -1f,
+                "GU_RR_WaitForRiderTimer_Description".Translate());
+            waitForRiderTimer = (int)options.Slider(waitForRiderTimer, 0f, 30000f);
 
-            Widgets.DrawMenuSection(mountableFilterRect); //Used to make the background light grey with white border
-            TabDrawer.DrawTabs(
-                new Rect(mountableFilterRect.x, mountableFilterRect.y, mountableFilterRect.width, Text.LineHeight),
-                tabs);
-
-            //========Between tabs and scroll body=========
-            options.Begin(new Rect(mountableFilterRect.x + 10, mountableFilterRect.y + 10,
-                mountableFilterRect.width - 10f, mountableFilterRect.height - 10f));
-            if (selectedTab == SelectedTab.BodySize)
-            {
-                options.Label("GUC_BodySizeFilter_Title".Translate("0", "5", "1.2", bodySizeFilter.ToString()), -1f,
-                    "GUC_BodySizeFilter_Description".Translate());
-                bodySizeFilter = options.Slider((float)Math.Round(bodySizeFilter, 1), 0f, 5f);
-            }
-            else
-            {
-                options.Label("GUC_DrawBehavior_Description".Translate());
-            }
-
-            options.End();
-            //========Scroll area=========
-            mountableFilterRect.y += 60f;
-            mountableFilterRect.yMax -= 60f;
-            var mountableFilterInnerRect = new Rect(0f, 0f, mountableFilterRect.width - 30f,
-                (OptionsDrawUtility.lineNumber + 2) * 22f);
-            Widgets.BeginScrollView(mountableFilterRect, ref scrollPos, mountableFilterInnerRect, true);
-            options.Begin(mountableFilterInnerRect);
-            options.DrawList();
-            options.End();
-            Widgets.EndScrollView();
+            options.CheckboxLabeled("GU_RR_NoMountedHunting_Title".Translate(), ref noMountedHunting,
+                "GU_RR_NoMountedHunting_Description".Translate());
+            options.CheckboxLabeled("GU_RR_DisableSlavePawnColumn_Title".Translate(), ref disableSlavePawnColumn,
+                "GU_RR_DisableSlavePawnColumn_Description".Translate());
+            options.CheckboxLabeled("GU_RR_AutomountDisabledByDefault_Title".Translate(),
+                ref automountDisabledByDefault, "GU_RR_AutomountDisabledByDefault_Description".Translate());
+            if (Prefs.DevMode)
+                options.CheckboxLabeled("Enable dev mode logging", ref logging);
         }
+
+        options.End();
+    }
+
+    private void DrawBattleMounts(Rect rect)
+    {
+        var options = new Listing_Standard();
+        options.Begin(rect.ContractedBy(15f));
+
+        options.CheckboxLabeled("GU_Enable_BattleMounts".Translate(), ref battleMountsEnabled,
+            "GU_Enable_BattleMounts_Description".Translate());
+        if (battleMountsEnabled)
+        {
+            options.Gap();
+            options.GapLine(); //=============================
+            options.Gap();
+
+            options.CheckboxLabeled("GU_Enable_SaddleUp".Translate(), ref saddleUpEnabled, "GU_Enable_SaddleUp_Description".Translate());
+
+            options.Label("BM_MinHandlingLevel_Title".Translate("0", "20", "3", minHandlingLevel.ToString()), -1f,
+                "BM_MinHandlingLevel_Description".Translate());
+            minHandlingLevel = (int)options.Slider(minHandlingLevel, 0f, 20f);
+
+            options.Label("BM_EnemyMountChance_Title".Translate("0", "100", "15", enemyMountChance.ToString()), -1f,
+                "BM_EnemyMountChance_Description".Translate());
+            enemyMountChance = (int)options.Slider(enemyMountChance, 0f, 100f);
+
+            options.Label(
+                "BM_EnemyMountChanceTribal_Title".Translate("0", "100", "33", enemyMountChancePreInd.ToString()),
+                -1f, "BM_EnemyMountChanceTribal_Description".Translate());
+            enemyMountChancePreInd = (int)options.Slider(enemyMountChancePreInd, 0f, 100f);
+
+            options.Label("BM_InBiomeWeight_Title".Translate("0", "100", "20", inBiomeWeight.ToString()), -1f,
+                "BM_InBiomeWeight_Description".Translate());
+            inBiomeWeight = options.Slider((float)Math.Round(inBiomeWeight), 0f, 100f);
+
+            options.Label("BM_OutBiomeWeight_Title".Translate("0", "100", "10", outBiomeWeight.ToString()), -1f,
+                "BM_OutBiomeWeight_Description".Translate());
+            outBiomeWeight = (int)options.Slider((float)Math.Round(outBiomeWeight), 0f, 100f);
+
+            options.Label("BM_NonWildWeight_Title".Translate("0", "100", "70", nonWildWeight.ToString()), -1f,
+                "BM_NonWildWeight_Description".Translate());
+            nonWildWeight = (int)options.Slider((float)Math.Round(nonWildWeight), 0f, 100f);
+        }
+
+        options.End();
+    }
+
+    private void DrawCaravan(Rect rect)
+    {
+        var options = new Listing_Standard();
+        options.Begin(rect.ContractedBy(15f));
+
+        options.CheckboxLabeled("GU_Enable_Caravans".Translate(), ref caravansEnabled,
+            "GU_Enable_Caravans_Description".Translate());
+        if (caravansEnabled)
+        {
+            options.Gap();
+            options.GapLine(); //=============================
+            options.Gap();
+
+            options.Label(
+                "GU_Car_visitorMountChance_Title".Translate("0", "100", "15", visitorMountChance.ToString()), -1f,
+                "GU_Car_visitorMountChance_Description".Translate());
+            visitorMountChance = (int)options.Slider(visitorMountChance, 0f, 100f);
+
+            options.Label(
+                "GU_Car_visitorMountChanceTribal_Title".Translate("0", "100", "33",
+                    visitorMountChancePreInd.ToString()), -1f,
+                "GU_Car_visitorMountChanceTribal_Description".Translate());
+            visitorMountChancePreInd = (int)options.Slider(visitorMountChancePreInd, 0f, 100f);
+
+            options.CheckboxLabeled("GU_Car_GiveCaravanSpeed_Title".Translate(), ref giveCaravanSpeed,
+                "GU_Car_GiveCaravanSpeed_Description".Translate());
+            options.CheckboxLabeled("GU_Car_RidePackAnimals_Title".Translate(), ref ridePackAnimals,
+                "GU_Car_RidePackAnimals_Description".Translate());
+        }
+
+        options.End();
+    }
+
+    private void DrawMechanoid(Rect rect)
+    {
+        var options = new Listing_Standard();
+        var display = rect.ContractedBy(15f);
+        options.Begin(display);
+
+        options.CheckboxLabeled("GU_Enable_Mechanoids".Translate(), ref mechanoidsEnabled, "GU_Enable_Mechanoids_Description".Translate());
+
+        if (!mechanoidsEnabled)
+        {
+            options.End();
+            return;
+        }
+
+        options.Gap();
+        options.GapLine(); //=============================
+        options.Gap();
+
+        options.Label("GU_BME_MountChance_Title".Translate("0", "100", "40", mountChance.ToString()),
+            tooltip: "GU_BME_MountChance_Description".Translate());
+        mountChance = (int)options.Slider(mountChance, 0f, 100f);
+
+        options.CheckboxLabeled("GUM_DisCarCap".Translate(), ref disregardMechCarryingCapacity,
+            "GUM_DisCarCapText".Translate());
+
+        options.GapLine();
+        options.Gap();
+        options.Label("GUM_AllowedMechs".Translate());
+        //========Search widget=========
+        var searchRect = options.GetRect(Text.LineHeight);
+        searchRect.width -= 20f; // Scroll bar alignment
+        search.OnGUI(searchRect);
+        var mechsForViewing = Setup.AllMechs.Where(mech =>
+            search.filter.Matches(mech?.label)
+            || search.filter.Matches(mech?.defName)
+            || search.filter.Matches(mech?.modContentPack?.Name)).ToList();
+        var previousControls = options.CurHeight;
+        options.End();
+        
+        var scrollView = display.BottomPartPixels(display.height - previousControls);
+        var innerRect = scrollView with
+        {
+            width = scrollView.width - 20f,
+            height = mechLineNumber * OptionsDrawUtility.LineHeight
+        };
+
+        var min = mechScrollPos.y == 0 ? 0 : (int)Mathf.Floor(mechScrollPos.y / OptionsDrawUtility.LineHeight) - 1;
+        var max = (int)Mathf.Ceil(scrollView.height / OptionsDrawUtility.LineHeight) + min + 2;
+        var viewRange = new IntRange(min - 1, max + 1);
+
+        Widgets.BeginScrollView(scrollView, ref mechScrollPos, innerRect);
+        options.Begin(innerRect);
+        options.DrawList(mechsForViewing, MechSelectedCache, viewRange, out mechLineNumber);
+        options.End();
+        Widgets.EndScrollView();
+    }
+
+    private void DrawIdeo(Rect rect)
+    {
+        var options = new Listing_Standard();
+        var display = rect.ContractedBy(15f);
+        options.Begin(display);
+
+        options.CheckboxLabeled("GU_Enable_Ideology".Translate(),  ref ideoEnabled, "GU_Enable_Ideology_Description".Translate());
+
+        options.End();
+    }
+
+    private static Color SelectedColor = new Color(0.5f, 1f, 0.5f, 1f);
+    private void DrawTabs(Rect rect, List<TabRecord> tabs)
+    {
+        var buttons = tabs.Count;
+        var rects = SplitRectangle(rect, buttons, 4f);
+
+        var color = GUI.color;
+        for (var index = 0; index < rects.Length; index++)
+        {
+            var button = rects[index];
+            var tab = tabs[index];
+
+            if (tab.Selected)
+                GUI.color = SelectedColor;
+            if (Widgets.ButtonText(button, tab.label))
+                tab.clickedAction();
+            GUI.color = color;
+        }
+    }
+
+    private Rect[] SplitRectangle(Rect rect, int count, float margin)
+    {
+        var rects = new Rect[count];
+        var totalMargin = margin * (count - 1);
+        var usableWidth = rect.width - totalMargin;
+        var rectWidth = usableWidth / count;
+
+        for (var i = 0; i < count; i++)
+        {
+            var xPosition = rect.x + (i * (rectWidth + margin));
+            rects[i] = new Rect(xPosition, rect.y, rectWidth, rect.height);
+        }
+
+        return rects;
     }
 
     public override string SettingsCategory() => "Giddy-Up";
@@ -564,93 +446,7 @@ public class Mod_GiddyUp : Mod
         {
             Log.Error("[Giddy-Up] Error writing Giddy-Up settings. Skipping...\n" + ex);
         }
-
+        search.Reset();
         base.WriteSettings();
-    }
-}
-
-public class ModSettings_GiddyUp : ModSettings
-{
-    public static float handlingMovementImpact = 2.5f,
-        bodySizeFilter = 0.2f,
-        handlingAccuracyImpact = 0.5f,
-        inBiomeWeight = 20f,
-        outBiomeWeight = 10f,
-        nonWildWeight = 70f,
-        injuredThreshold = 0.75f;
-
-    public static int accuracyPenalty = 10,
-        minAutoMountDistance = 120,
-        minHandlingLevel = 3,
-        enemyMountChance = 15,
-        enemyMountChancePreInd = 33,
-        visitorMountChance = 15,
-        visitorMountChancePreInd = 33,
-        autoHitchDistance = 50,
-        waitForRiderTimer = 10000;
-
-    public static bool rideAndRollEnabled = true,
-        battleMountsEnabled = true,
-        caravansEnabled = true,
-        noMountedHunting,
-        logging,
-        giveCaravanSpeed,
-        automountDisabledByDefault,
-        disableSlavePawnColumn,
-        ridePackAnimals = true;
-
-    public static HashSet<string>?
-        invertMountingRules,
-        invertDrawRules; //These are only used on game start to setup the below, fast cache collections
-
-    public static readonly HashSet<ushort> MountableCache = [];
-    public static readonly HashSet<ushort> DrawRulesCache = [];
-    private static string? _tabsHandler;
-    public static Vector2 scrollPos;
-    public static SelectedTab selectedTab = SelectedTab.BodySize;
-
-    public enum SelectedTab
-    {
-        BodySize,
-        DrawBehavior,
-        Core,
-        Rnr,
-        BattleMounts,
-        Caravans
-    };
-    
-    public static Dictionary<string, float>? offsetCache;
-    
-    public override void ExposeData()
-    {
-        Scribe_Values.Look(ref handlingMovementImpact, "handlingMovementImpact", 2.5f);
-        Scribe_Values.Look(ref handlingAccuracyImpact, "handlingAccuracyImpact", 0.5f);
-        Scribe_Values.Look(ref accuracyPenalty, "accuracyPenalty", 10);
-        Scribe_Values.Look(ref minAutoMountDistance, "minAutoMountDistanceNew", 120);
-        Scribe_Values.Look(ref minHandlingLevel, "minHandlingLevel", 3);
-        Scribe_Values.Look(ref enemyMountChance, "enemyMountChance", 15);
-        Scribe_Values.Look(ref enemyMountChancePreInd, "enemyMountChancePreInd", 33);
-        Scribe_Values.Look(ref inBiomeWeight, "inBiomeWeight", 20f);
-        Scribe_Values.Look(ref outBiomeWeight, "outBiomeWeight", 10f);
-        Scribe_Values.Look(ref nonWildWeight, "nonWildWeight", 70);
-        Scribe_Values.Look(ref visitorMountChance, "visitorMountChance", 15);
-        Scribe_Values.Look(ref visitorMountChancePreInd, "visitorMountChancePreInd", 33);
-        Scribe_Values.Look(ref autoHitchDistance, "autoHitchThreshold", 50);
-        Scribe_Values.Look(ref _tabsHandler, "tabsHandler");
-        Scribe_Values.Look(ref rideAndRollEnabled, "rideAndRollEnabled", true);
-        Scribe_Values.Look(ref battleMountsEnabled, "battleMountsEnabled", true);
-        Scribe_Values.Look(ref caravansEnabled, "caravansEnabled", true);
-        Scribe_Values.Look(ref noMountedHunting, "noMountedHunting");
-        Scribe_Values.Look(ref disableSlavePawnColumn, "disableSlavePawnColumn");
-        Scribe_Values.Look(ref automountDisabledByDefault, "automountDisabledByDefault");
-        Scribe_Values.Look(ref giveCaravanSpeed, "giveCaravanSpeed");
-        Scribe_Values.Look(ref ridePackAnimals, "ridePackAnimals", true);
-        Scribe_Values.Look(ref injuredThreshold, "injuredThreshold", 0.75f);
-        Scribe_Values.Look(ref waitForRiderTimer, "waitForRiderTimer", 10000);
-        Scribe_Collections.Look(ref invertMountingRules, "invertMountingRules", LookMode.Value);
-        Scribe_Collections.Look(ref invertDrawRules, "invertDrawRules", LookMode.Value);
-        Scribe_Collections.Look(ref offsetCache, "offsetCache", LookMode.Value);
-
-        base.ExposeData();
     }
 }

@@ -3,7 +3,7 @@ using Verse;
 using Verse.AI;
 using Verse.AI.Group;
 using System.Collections.Generic;
-using Settings = GiddyUp.ModSettings_GiddyUp;
+using static GiddyUp.ModSettings_GiddyUp;
 
 namespace GiddyUp;
 
@@ -76,9 +76,8 @@ public static class IsMountableUtility
             reason = Reason.NotInModOptions;
             return false;
         }
-        
-        //Is even an animal?
-        if (!animal.RaceProps.Animal || animal == rider)
+
+        if (!animal.RaceProps.Animal && !(mechanoidsEnabled && animal.RaceProps.IsMechanoid) || animal == rider)
         {
             reason = Reason.NotAnimal;
             return false;
@@ -92,7 +91,7 @@ public static class IsMountableUtility
         }
 
         //Check mod options
-        if (!Settings.MountableCache.Contains(animal.def.shortHash))
+        if (!MountableCache.Contains(animal.def.shortHash) && !(mechanoidsEnabled && MechSelectedCache.Contains(animal.def.shortHash)))
         {
             reason = Reason.NotInModOptions;
             return false;
@@ -149,16 +148,7 @@ public static class IsMountableUtility
 
             //TODO maybe add some logic to check if involved with a ritual
             //Check health
-            if (animal.Dead || animal.Downed || animal.InMentalState || !animal.Spawned ||
-                (animal.health != null &&
-                 animal.health.summaryHealth.SummaryHealthPercent < Settings.injuredThreshold) ||
-                animal.health.HasHediffsNeedingTend() ||
-                animal.HasAttachment(ThingDefOf.Fire) ||
-                (animal.Faction.def
-                     .isPlayer && //Need checks only apply to colonist animals because guest caravans ride this value down very low before leaving
-                 ((animal.needs.food != null && animal.needs.food.CurCategory >= HungerCategory.UrgentlyHungry) ||
-                  (animal.needs.rest != null && animal.needs.rest.CurCategory >= RestCategory.VeryTired)))
-               )
+            if (animal.IsInPoorCondition())
             {
                 reason = Reason.IsPoorCondition;
                 return false;
@@ -175,7 +165,7 @@ public static class IsMountableUtility
         }
 
         //Check age
-        if (!animal.ageTracker.Adult)
+        if (!disregardAnimalAge && !animal.ageTracker.Adult && !animal.RaceProps.IsMechanoid)
         {
             var customLifeStages = animal.def.GetModExtension<AllowedLifeStages>();
             if (customLifeStages == null || !customLifeStages.IsAllowedAge(animal.ageTracker.CurLifeStageIndex))
@@ -222,8 +212,13 @@ public static class IsMountableUtility
             out List<Pawn> claimants)
         {
             claimants = new List<Pawn>();
+            reservations ??= animal.Map.FetchReservedAnimals();
             if (reservations == null)
-                reservations = animal.Map.FetchReservedAnimals();
+            {
+                Log.WarningOnce($"Unable to check reservations for '{animal?.LabelShortCap ?? "Unknown"}'", animal?.thingIDNumber ?? 4320546);
+                return false;
+            }
+            
             for (var i = reservations.Count; i-- > 0;)
             {
                 var item = reservations[i];
@@ -287,12 +282,46 @@ public static class IsMountableUtility
 
     public static bool IsTooHeavy(this Pawn rider, Pawn animal)
     {
+        if (animal.RaceProps.IsMechanoid && disregardMechCarryingCapacity)
+            return false;
+
+        if (animal.IsAnimal && disregardAnimalCarryingCapacity)
+            return false;
+
         return rider.GetStatValue(StatDefOf.Mass) > animal.GetStatValue(StatDefOf.CarryingCapacity);
     }
 
-    public static List<ReservationManager.Reservation> FetchReservedAnimals(this Map map)
+    public static bool IsInPoorCondition(this Pawn animal)
+    {
+        if (animal.Dead || animal.Downed || animal.InMentalState || !animal.Spawned)
+            return false;
+
+        if (animal.health != null && injuredThreshold > 0)
+        {
+            if(animal.health.summaryHealth.SummaryHealthPercent < injuredThreshold ||
+               animal.health.hediffSet.hediffs.Any(x => x.CurStage is not null && animal.health.HasHediffsNeedingTend()))
+            return true;
+        }
+
+        if (animal.HasAttachment(ThingDefOf.Fire))
+            return true;
+
+        // ReSharper disable once InvertIf
+        if (animal.Faction.IsPlayer)
+        {
+            if (animal.needs.food is { CurCategory: >= HungerCategory.UrgentlyHungry } ||
+                animal.needs.rest is { CurCategory: >= RestCategory.VeryTired })
+                return true;
+        }
+
+        return false;
+    }
+
+    public static List<ReservationManager.Reservation>? FetchReservedAnimals(this Map map)
     {
         var workingList = new List<ReservationManager.Reservation>();
+        if (map?.reservationManager?.reservations == null)
+            return null;
         var list = map.reservationManager.reservations;
         for (var i = list.Count; i-- > 0;)
         {

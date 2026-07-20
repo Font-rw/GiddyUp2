@@ -17,12 +17,15 @@ public static class TextureUtility
     public static float FetchCache(Pawn animal)
     {
         var age = animal.ageTracker?.CurLifeStageIndex ?? 0;
-        Settings.offsetCache.TryGetValue(FormatKey(animal.def, age), out var offset);
+        Settings.offsetCache.TryGetValue(FormatKey(animal.kindDef, age), out var offset);
         return offset;
     }
 
-    public static float SetDrawOffset(PawnKindLifeStage age)
+    public static float? SetDrawOffset(PawnKindLifeStage age)
     {
+        if (age?.bodyGraphicData?.Graphic?.MatEast?.mainTexture as Texture2D == null)
+            return null;
+
         var unreadableTexture = age.bodyGraphicData.Graphic.MatEast.mainTexture as Texture2D;
         var t = GetReadableTexture(unreadableTexture);
         var backHeight = GetBackHeight(t);

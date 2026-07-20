@@ -64,12 +64,8 @@ internal static class Patch_DetermineNextJob
         {
             var pawnData = pawn.GetExtendedPawnData();
             var mount = pawnData.Mount;
-
-            var hasValidMountedDriver =
-                mount != null && mount.CurJobDef == ResourceBank.JobDefOf.Mounted && mount.jobs?.curDriver is JobDriver_Mounted driver &&  driver.Rider == pawn;
-
-            var allowedTemporaryJob =
-                mount != null &&  mount.CurJobDef == JobDefOf.RemoveApparel;
+            var hasValidMountedDriver = mount != null && mount.CurJobDef == ResourceBank.JobDefOf.Mounted && mount.jobs?.curDriver is JobDriver_Mounted driver &&  driver.Rider == pawn;
+            var allowedTemporaryJob = mount != null &&  mount.CurJobDef == JobDefOf.RemoveApparel;
 
             if (!hasValidMountedDriver && !allowedTemporaryJob)
                 pawn.Dismount(mount, pawnData, true);
@@ -80,7 +76,7 @@ internal static class Patch_DetermineNextJob
             {
                 var pawnData = pawn.GetExtendedPawnData();
                 var hostileMount = pawnData.ReservedMount;
-                if (hostileMount == null || !hostileMount.IsMountable(out var reason, pawn, true, true))
+                if (hostileMount == null || hostileMount.Map == null || !hostileMount.IsMountable(out var reason, pawn, true, true))
                     return;
                 var qJob = pawn.jobs.jobQueue.FirstOrFallback(null);
                 if (qJob?.job.def == ResourceBank.JobDefOf.Mount ||

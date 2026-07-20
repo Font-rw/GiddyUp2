@@ -483,3 +483,7 @@ fabric.properties
 # Android studio 3.1+ serialized cache file
 .idea/caches/build_file_checksums.ser
 
+Workshop/
+/.github/agents
+/1.6/Assemblies/Newtonsoft.Json.dll
+/1.6/Assemblies/RimMCP.Tools.dll

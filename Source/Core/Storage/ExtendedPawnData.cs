@@ -10,7 +10,11 @@ public class ExtendedPawnData : IExposable
     public Pawn? Pawn => _pawn;
     
     private Pawn? _mount;
-    public Pawn? Mount { get; set; }
+    public Pawn? Mount
+    {
+        get => _mount;
+        set => _mount = value;
+    }
 
     public int ID;
 
@@ -69,12 +73,20 @@ public class ExtendedPawnData : IExposable
         }
     }
 
+    private Pawn? _rider;
+    public Pawn? Rider
+    {
+        get => _rider;
+        set => _rider = value;
+    }
+
     public void ExposeData()
     {
         Scribe_References.Look(ref _pawn, "pawn");
         Scribe_References.Look(ref _mount, "mount");
         Scribe_References.Look(ref _reservedBy, "reservedBy");
         Scribe_References.Look(ref _reservedMount, "reservedMount");
+        Scribe_References.Look(ref _rider, "rider");
 
         Scribe_Values.Look(ref ID, "ID");
         Scribe_Values.Look(ref automount, "automount", Automount.Anyone);
